@@ -54,7 +54,7 @@ def call_api(operation, key, **params):
     return result
 
 
-def convert_polygons(result, name, expected_breaks=None, direction="Unknown"):
+def convert_polygons(result, name, expected_breaks=None, direction="Unknown", travel_mode="Unknown"):
     """Repair self-touching rings and preserve even-odd polygon interiors."""
     import math
     from shapely import make_valid
@@ -114,6 +114,7 @@ def convert_polygons(result, name, expected_breaks=None, direction="Unknown"):
         attributes = dict(source.get("attributes", {}))
         attributes["SiteName"] = name
         attributes["Direction"] = direction
+        attributes["TravelMode"] = travel_mode
         attributes["RepairedRings"] = repaired_count
         attributes["CollapsedParts"] = collapsed_count
         features.append({"type": "Feature", "properties": attributes, "geometry": mapping(geometry)})
@@ -170,9 +171,9 @@ def calculate_catchments(key, name, lon, lat, breaks, direction, mode, raw):
                           splitPolygonsAtBreaks="false", overlapPolygons="true",
                           returnFacilities="true", outSR="4326")
         raw["responses"].append({"direction": label, "response": result})
-        features.extend(convert_polygons(result, name, breaks, label)["features"])
+        features.extend(convert_polygons(result, name, breaks, label, mode.get("name", "Unknown"))["features"])
     return {"data": {"type": "FeatureCollection", "features": features},
-            "name": name, "lon": lon, "lat": lat}
+            "name": name, "lon": lon, "lat": lat, "mode": mode.get("name", "Unknown")}
 
 
 def restore_saved(raw):
@@ -185,6 +186,7 @@ def restore_saved(raw):
         label = entry.get("direction", "Unknown")
         for feature in item["data"]["features"]:
             feature["properties"]["Direction"] = label
+            feature["properties"]["TravelMode"] = raw.get("travel_mode", "Unknown")
         recovered.append(item)
     if not recovered:
         raise ValueError("No saved responses found.")
@@ -192,7 +194,84 @@ def restore_saved(raw):
     if any(abs(r["lon"]-first["lon"]) > 1e-7 or abs(r["lat"]-first["lat"]) > 1e-7 for r in recovered):
         raise ValueError("Saved responses must refer to the same site.")
     first["data"]["features"] = [f for r in recovered for f in r["data"]["features"]]
+    first["mode"] = raw.get("travel_mode", "Unknown")
     return first
+
+
+MODE_NAMES = {"Truck": "Trucking Time", "Car": "Driving Time", "Walking": "Walking Time"}
+
+
+def choose_mode(modes, label):
+    target = MODE_NAMES[label]
+    mode = next((m for m in modes if m.get("name") == target), None)
+    if mode is None:
+        raise ValueError("{} is not available from your Esri service. Available modes: {}".format(
+            target, ", ".join(str(m.get("name", "Unnamed")) for m in modes)))
+    return mode
+
+
+def railway_geojson(payload):
+    """Keep OSM railway ways with valid geometry and explicit source attributes."""
+    import math
+    if not isinstance(payload, dict) or "elements" not in payload:
+        raise ValueError("The railway service returned an unexpected response.")
+    if payload.get("remark"):
+        raise ValueError("The railway query did not complete. Try a smaller radius later.")
+    features = []
+    for way in payload["elements"]:
+        if way.get("type") != "way":
+            continue
+        tags = way.get("tags", {})
+        if tags.get("railway") not in ("rail", "narrow_gauge"):
+            continue
+        coordinates = []
+        for point in way.get("geometry", []):
+            x, y = point.get("lon"), point.get("lat")
+            if (not isinstance(x, (int, float)) or not isinstance(y, (int, float))
+                    or not math.isfinite(x) or not math.isfinite(y) or not -180 <= x <= 180 or not -90 <= y <= 90):
+                coordinates = []
+                break
+            coordinates.append([x, y])
+        if len(coordinates) < 2:
+            continue
+        features.append({"type": "Feature", "properties": {
+            "OSM_ID": way.get("id"), "Name": tags.get("name", "Not recorded"),
+            "Railway": tags["railway"], "Operator": tags.get("operator", "Not recorded"),
+            "Usage": tags.get("usage", "Not recorded"), "Service": tags.get("service", "Not recorded"),
+            "Source": "OpenStreetMap", "License": "ODbL-1.0"},
+            "geometry": {"type": "LineString", "coordinates": coordinates}})
+    if len(features) > 15000:
+        raise ValueError("Too many track segments for this map. Select a smaller railway radius.")
+    return {"type": "FeatureCollection", "features": features,
+            "attribution": "© OpenStreetMap contributors; ODbL-1.0; https://www.openstreetmap.org/copyright",
+            "osm_base_timestamp": payload.get("osm3s", {}).get("timestamp_osm_base", "Unknown")}
+
+
+def fetch_railways(lon, lat, radius_km, endpoint):
+    """One bounded, on-demand Overpass request; never retry automatically."""
+    import json
+    import requests
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90 and 0 < radius_km <= 100):
+        raise ValueError("Invalid railway location or radius.")
+    query = ('[out:json][timeout:45][maxsize:67108864];'
+             'way["railway"~"^(rail|narrow_gauge)$"](around:{},{},{});out tags geom;').format(
+                 int(radius_km * 1000), lat, lon)
+    try:
+        with requests.post(endpoint, data={"data": query}, timeout=(15, 60), stream=True,
+                           headers={"User-Agent": "CatchmentExplorer-RailOverlay/1.0"}) as response:
+            if response.status_code in (429, 503, 504):
+                raise RuntimeError("The railway service is busy or timed out. Keep your catchments and try a smaller radius later.")
+            response.raise_for_status()
+            chunks, size = [], 0
+            for chunk in response.iter_content(chunk_size=65536):
+                size += len(chunk)
+                if size > 20 * 1024 * 1024:
+                    raise RuntimeError("Railway response is too large. Select a smaller radius.")
+                chunks.append(chunk)
+            payload = json.loads(b"".join(chunks))
+    except (requests.exceptions.RequestException, json.JSONDecodeError):
+        raise RuntimeError("Railways could not be loaded. Existing catchments are unchanged; try a smaller radius later.") from None
+    return railway_geojson(payload)
 
 
 def web_app():
@@ -204,7 +283,7 @@ def web_app():
 
     st.set_page_config(page_title="Truck Catchment Explorer", page_icon="🌍", layout="wide")
     st.title("Truck Catchment Explorer")
-    st.caption("Esri truck routing • Custom drive times • From / To / Both • GeoJSON for QGIS")
+    st.caption("Esri routing • Truck / Car / Walking • From / To / Both • Optional OSM railways")
     key = os.environ.get("ESRI_API_KEY", "")
     if not key:
         try:
@@ -221,18 +300,19 @@ def web_app():
                                   value=49.69110, format="%.5f", step=0.00001)
             times = st.text_input("Drive times (minutes)", "45,60,90",
                                  help="Comma-separated values greater than 0 and less than 300.", max_chars=200)
+            mode_label = st.selectbox("Travel mode", list(MODE_NAMES))
             direction = st.selectbox("Travel direction", ["From site", "To site", "Both"])
             submitted = st.form_submit_button("Calculate catchments", type="primary")
         st.caption("From: leaving the site. To: arriving at the site. Both: two separate analyses.")
         st.caption("Each polygon covers the full area within its time limit (for example 0–45, 0–60, 0–90 minutes).")
-        st.caption("Trucking Time • Default truck profile • No departure/arrival time or custom vehicle dimensions.")
+        st.caption("Travel modes are verified against your Esri service before calculation. Default vehicle profiles; no departure/arrival time or custom dimensions.")
         st.caption("Both makes two service-area requests and uses more Esri allowance. Downloads do not recalculate.")
 
     with st.expander("Restore saved Esri JSON — no API request"):
         uploaded = st.file_uploader("Upload saved Esri JSON", type=["json"])
         restore = st.button("Load saved result", disabled=uploaded is None)
     if restore and uploaded is not None:
-        for field in ("result", "problem", "raw"):
+        for field in ("result", "problem", "raw", "rail_result", "rail_problem"):
             st.session_state.pop(field, None)
         try:
             raw = json.loads(uploaded.getvalue())
@@ -243,24 +323,21 @@ def web_app():
         except (ValueError, KeyError, TypeError) as exc:
             st.session_state["problem"] = "Cannot import this response: " + str(exc)
     if submitted:
-        for field in ("result", "problem", "raw"):
+        for field in ("result", "problem", "raw", "rail_result", "rail_problem"):
             st.session_state.pop(field, None)
         try:
             breaks = parse_breaks(times)
             if not key:
                 raise ValueError("Set ESRI_API_KEY in Streamlit Secrets or run python app.py locally.")
-            with st.spinner("Calculating truck catchments..."):
-                if "truck_mode" not in st.session_state:
-                    modes = call_api("retrieveTravelModes", key).get("supportedTravelModes", [])
-                    mode = next((m for m in modes if m.get("name") == "Trucking Time"), None)
-                    if mode is None:
-                        raise ValueError("Trucking Time is unavailable for this credential.")
-                    st.session_state["truck_mode"] = mode
+            with st.spinner("Calculating catchments..."):
+                if "travel_modes" not in st.session_state:
+                    st.session_state["travel_modes"] = call_api("retrieveTravelModes", key).get("supportedTravelModes", [])
+                mode = choose_mode(st.session_state["travel_modes"], mode_label)
                 raw = {"format": "truck-catchments-v2", "requested_breaks": breaks,
-                       "requested_direction": direction, "polygon_type": "cumulative", "responses": []}
+                       "requested_direction": direction, "travel_mode": mode["name"], "polygon_type": "cumulative", "responses": []}
                 st.session_state["raw"] = raw
                 st.session_state["result"] = calculate_catchments(
-                    key, name, lon, lat, breaks, direction, st.session_state["truck_mode"], raw)
+                    key, name, lon, lat, breaks, direction, mode, raw)
         except (RuntimeError, ValueError) as exc:
             message = str(exc)
             st.session_state["problem"] = message.replace(key, "[redacted]") if key else message
@@ -285,6 +362,8 @@ def web_app():
     saved = st.session_state["result"]
     data = saved["data"]
     features = data["features"]
+    for feature in features:
+        feature["properties"].setdefault("TravelMode", saved.get("mode", "Unknown"))
     breaks = sorted({float(f["properties"]["ToBreak"]) for f in features})
     labels = sorted({f["properties"].get("Direction", "Unknown") for f in features})
     repairs = sum(f["properties"].get("RepairedRings", 0) for f in features)
@@ -293,10 +372,11 @@ def web_app():
     if any(f["properties"].get("CollapsedParts", 0) for f in features):
         st.warning("Collapsed line/point parts were omitted from polygon output. Keep the raw JSON for review.")
     st.success("Catchments ready for {} ({:.5f}, {:.5f}).".format(saved["name"], saved["lon"], saved["lat"]))
+    st.caption("Calculated travel mode: " + saved.get("mode", "Unknown (legacy saved result)"))
     suffix = "_".join(format(v, "g") for v in breaks)
     direction_tag = "both" if len(labels) > 1 else labels[0].split()[0].lower()
     st.download_button("Download GeoJSON for QGIS", json.dumps(data),
-                       file_name="truck_catchments_{}_{}.geojson".format(direction_tag, suffix),
+                       file_name="catchments_{}_{}_{}.geojson".format(saved.get("mode", "unknown").lower().replace(" ", "_"), direction_tag, suffix),
                        mime="application/geo+json")
     if "Unknown" in labels:
         st.warning("This legacy response does not record direction. Its original ring/disk geometry is preserved.")
@@ -304,6 +384,39 @@ def web_app():
     colors = {v: palette[i % len(palette)] for i, v in enumerate(breaks)}
     st.caption("Time limits: " + " / ".join(format(v, "g") + " min" for v in breaks)
                + ". From: solid outlines. To: dashed outlines. Use map layers to compare directions and times.")
+    with st.expander("Railway overlay — load separately", expanded=True):
+        st.caption("Load mapped rail and narrow-gauge tracks near the calculated site. Passenger and freight tracks may both appear; this is not a verified freight-access map.")
+        radius = st.select_slider("Railway search radius (km)", options=[10, 25, 50, 75, 100], value=25)
+        st.caption("Only the selected radius is queried, not the entire catchment or the current map view. Larger areas may time out. Railways do not change Esri routing.")
+        load_rail = st.button("Load nearby railways", key="load_rail")
+        if load_rail:
+            import time
+            previous = st.session_state.get("last_rail_request", 0)
+            if time.monotonic() - previous < 30:
+                st.warning("Please wait 30 seconds between railway load attempts.")
+            else:
+                st.session_state["last_rail_request"] = time.monotonic()
+                st.session_state.pop("rail_problem", None)
+                endpoint = os.environ.get("OVERPASS_URL", "https://overpass.private.coffee/api/interpreter")
+                try:
+                    cached_fetch = st.cache_data(ttl=86400, max_entries=32, show_spinner=False)(fetch_railways)
+                    with st.spinner("Loading OSM railways; existing catchments are kept..."):
+                        rail = cached_fetch(round(saved["lon"], 6), round(saved["lat"], 6), radius, endpoint)
+                    st.session_state["rail_result"] = {"data": rail, "radius": radius}
+                except (RuntimeError, ValueError) as exc:
+                    st.session_state["rail_problem"] = str(exc)
+        if "rail_problem" in st.session_state:
+            st.warning(st.session_state["rail_problem"])
+        show_rail = st.checkbox("Show loaded railways", value=True)
+        rail_saved = st.session_state.get("rail_result")
+        if rail_saved is not None:
+            rail = rail_saved["data"]
+            st.caption("Loaded {} track segments using a {} km search radius. OSM data can be incomplete or outdated; selected ways may extend beyond the radius.".format(len(rail["features"]), rail_saved["radius"]))
+            if not rail["features"]:
+                st.info("No mapped rail tracks were returned. This does not prove there are no railways nearby.")
+            st.download_button("Download railway GeoJSON for QGIS", json.dumps(rail),
+                               file_name="osm_railways.geojson", mime="application/geo+json")
+        st.markdown("Railway data: [© OpenStreetMap contributors (ODbL)](https://www.openstreetmap.org/copyright). Queries via Overpass by Private.coffee; no extra API key required.")
     m = folium.Map(location=[saved["lat"], saved["lon"]], zoom_start=7, tiles="OpenStreetMap")
     bounds = []
     for label in labels:
@@ -318,10 +431,15 @@ def web_app():
                         "dashArray": "7 5" if dashed else None}
             layer = folium.GeoJson(group, name="{} — {} min".format(label, format(value, "g")),
                 style_function=style, tooltip=folium.GeoJsonTooltip(
-                    fields=["Direction", "FromBreak", "ToBreak"],
-                    aliases=["Direction", "Lower bound (min)", "Upper bound (min)"]))
+                    fields=["Direction", "TravelMode", "FromBreak", "ToBreak"],
+                    aliases=["Direction", "Travel mode", "Lower bound (min)", "Upper bound (min)"]))
             layer.add_to(m)
             bounds.extend(layer.get_bounds())
+    if show_rail and rail_saved is not None and rail_saved["data"]["features"]:
+        folium.GeoJson(rail_saved["data"], name="OSM railways ({} km search)".format(rail_saved["radius"]),
+                       style_function=lambda f: {"color": "#171717", "weight": 3, "opacity": 0.85},
+                       tooltip=folium.GeoJsonTooltip(fields=["Name", "Railway", "Operator", "Usage"],
+                                                   aliases=["Name", "Rail type", "Operator", "Usage"])).add_to(m)
     folium.CircleMarker([saved["lat"], saved["lon"]], radius=6, color="#ea580c", fill=True,
                         fill_opacity=1, tooltip=html.escape(saved["name"])).add_to(m)
     if bounds:
