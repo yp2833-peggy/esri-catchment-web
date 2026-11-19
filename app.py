@@ -54,7 +54,7 @@ def call_api(operation, key, **params):
     return result
 
 
-def convert_polygons(result, name):
+def convert_polygons(result, name, expected_breaks=None, direction="Unknown"):
     """Repair self-touching rings and preserve even-odd polygon interiors."""
     import math
     from shapely import make_valid
@@ -113,12 +113,18 @@ def convert_polygons(result, name):
             raise ValueError("Unexpected geometry type.")
         attributes = dict(source.get("attributes", {}))
         attributes["SiteName"] = name
+        attributes["Direction"] = direction
         attributes["RepairedRings"] = repaired_count
         attributes["CollapsedParts"] = collapsed_count
         features.append({"type": "Feature", "properties": attributes, "geometry": mapping(geometry)})
     breaks = {float(f["properties"].get("ToBreak", -1)) for f in features}
-    if not {90, 120}.issubset(breaks):
-        raise ValueError("Both 90 and 120 minute ranges were not returned. Inspect the raw response.")
+    if not features:
+        raise ValueError("No service-area polygons returned.")
+    if expected_breaks is not None and any(
+        not any(abs(value - actual) < 1e-6 for actual in breaks)
+        for value in expected_breaks
+    ):
+        raise ValueError("Some requested time ranges were not returned. Inspect the raw response.")
     return {"type": "FeatureCollection", "features": features}
 
 
@@ -136,6 +142,59 @@ def recover_response(result):
     return {"data": convert_polygons(result, name), "name": name, "lon": lon, "lat": lat}
 
 
+DIRECTIONS = {"From site": "esriNATravelDirectionFromFacility",
+              "To site": "esriNATravelDirectionToFacility"}
+
+
+def parse_breaks(text):
+    import math
+    try:
+        values = [float(part.strip()) for part in text.split(",")]
+    except (ValueError, AttributeError):
+        raise ValueError("Enter comma-separated minutes, for example: 45,60,90.") from None
+    if not values or any(not math.isfinite(v) or not 0 < v < 300 for v in values):
+        raise ValueError("Every drive time must be greater than 0 and less than 300 minutes.")
+    return sorted(set(values))
+
+
+def calculate_catchments(key, name, lon, lat, breaks, direction, mode, raw):
+    """Retain each response immediately, including on a partial Both failure."""
+    import json
+    facilities = {"geometryType": "esriGeometryPoint", "spatialReference": {"wkid": 4326},
+                  "features": [{"geometry": {"x": lon, "y": lat}, "attributes": {"Name": name}}]}
+    features = []
+    for label in (list(DIRECTIONS) if direction == "Both" else [direction]):
+        result = call_api("solveServiceArea", key, facilities=json.dumps(facilities),
+                          travelMode=json.dumps(mode), defaultBreaks=",".join(format(v, "g") for v in breaks),
+                          travelDirection=DIRECTIONS[label], outputPolygons="esriNAOutputPolygonSimplified",
+                          splitPolygonsAtBreaks="false", overlapPolygons="true",
+                          returnFacilities="true", outSR="4326")
+        raw["responses"].append({"direction": label, "response": result})
+        features.extend(convert_polygons(result, name, breaks, label)["features"])
+    return {"data": {"type": "FeatureCollection", "features": features},
+            "name": name, "lon": lon, "lat": lat}
+
+
+def restore_saved(raw):
+    if raw.get("format") != "truck-catchments-v2":
+        # A legacy raw response does not record travel direction reliably.
+        return recover_response(raw)
+    recovered = []
+    for entry in raw.get("responses", []):
+        item = recover_response(entry["response"])
+        label = entry.get("direction", "Unknown")
+        for feature in item["data"]["features"]:
+            feature["properties"]["Direction"] = label
+        recovered.append(item)
+    if not recovered:
+        raise ValueError("No saved responses found.")
+    first = recovered[0]
+    if any(abs(r["lon"]-first["lon"]) > 1e-7 or abs(r["lat"]-first["lat"]) > 1e-7 for r in recovered):
+        raise ValueError("Saved responses must refer to the same site.")
+    first["data"]["features"] = [f for r in recovered for f in r["data"]["features"]]
+    return first
+
+
 def web_app():
     import json
     import html
@@ -145,108 +204,137 @@ def web_app():
 
     st.set_page_config(page_title="Truck Catchment Explorer", page_icon="🌍", layout="wide")
     st.title("Truck Catchment Explorer")
-    st.caption("Esri Routing • 90 / 120 minutes • GeoJSON for QGIS")
+    st.caption("Esri truck routing • Custom drive times • From / To / Both • GeoJSON for QGIS")
     key = os.environ.get("ESRI_API_KEY", "")
-
+    if not key:
+        try:
+            key = st.secrets.get("ESRI_API_KEY", "")
+        except FileNotFoundError:
+            key = ""
     with st.sidebar:
-        st.header("Site input")
+        st.header("Site and routing input")
         with st.form("calculate"):
             name = st.text_input("Site name", "WRRP Site", max_chars=100)
             lon = st.number_input("Longitude", min_value=-180.0, max_value=180.0,
                                   value=-97.13540, format="%.5f", step=0.00001)
             lat = st.number_input("Latitude", min_value=-90.0, max_value=90.0,
                                   value=49.69110, format="%.5f", step=0.00001)
+            times = st.text_input("Drive times (minutes)", "45,60,90",
+                                 help="Comma-separated values greater than 0 and less than 300.", max_chars=200)
+            direction = st.selectbox("Travel direction", ["From site", "To site", "Both"])
             submitted = st.form_submit_button("Calculate catchments", type="primary")
-        st.caption("Trucking Time • Travel TO the site • Default truck profile")
-        st.caption("Output: 0–90 min and 90–120 min rings. Combine both for the full 0–120 min area.")
-        st.caption("No departure/arrival time or custom vehicle dimensions are set. Network coverage varies by location.")
-        st.caption("Calculations use your Esri account's service allowance or billing. Downloads do not repeat the calculation.")
+        st.caption("From: leaving the site. To: arriving at the site. Both: two separate analyses.")
+        st.caption("Each polygon covers the full area within its time limit (for example 0–45, 0–60, 0–90 minutes).")
+        st.caption("Trucking Time • Default truck profile • No departure/arrival time or custom vehicle dimensions.")
+        st.caption("Both makes two service-area requests and uses more Esri allowance. Downloads do not recalculate.")
 
-    with st.expander("Restore saved Esri JSON — no API request", expanded=False):
-        uploaded = st.file_uploader("Upload esri_response.json", type=["json"])
+    with st.expander("Restore saved Esri JSON — no API request"):
+        uploaded = st.file_uploader("Upload saved Esri JSON", type=["json"])
         restore = st.button("Load saved result", disabled=uploaded is None)
     if restore and uploaded is not None:
-        st.session_state.pop("result", None)
-        st.session_state.pop("problem", None)
+        for field in ("result", "problem", "raw"):
+            st.session_state.pop(field, None)
         try:
-            result = json.loads(uploaded.getvalue())
-            if not isinstance(result, dict):
-                raise ValueError("Upload a complete Esri response JSON object.")
-            st.session_state["raw"] = result
-            st.session_state["result"] = recover_response(result)
+            raw = json.loads(uploaded.getvalue())
+            if not isinstance(raw, dict):
+                raise ValueError("Upload a complete response object.")
+            st.session_state["raw"] = raw
+            st.session_state["result"] = restore_saved(raw)
         except (ValueError, KeyError, TypeError) as exc:
             st.session_state["problem"] = "Cannot import this response: " + str(exc)
-
     if submitted:
-        st.session_state.pop("result", None)
-        st.session_state.pop("raw", None)
-        st.session_state.pop("problem", None)
-        with st.spinner("Requesting Esri truck catchments. Please wait..."):
-            try:
-                if not key:
-                    raise ValueError("Restart with python app.py and enter an API key to calculate.")
+        for field in ("result", "problem", "raw"):
+            st.session_state.pop(field, None)
+        try:
+            breaks = parse_breaks(times)
+            if not key:
+                raise ValueError("Set ESRI_API_KEY in Streamlit Secrets or run python app.py locally.")
+            with st.spinner("Calculating truck catchments..."):
                 if "truck_mode" not in st.session_state:
                     modes = call_api("retrieveTravelModes", key).get("supportedTravelModes", [])
                     mode = next((m for m in modes if m.get("name") == "Trucking Time"), None)
                     if mode is None:
                         raise ValueError("Trucking Time is unavailable for this credential.")
                     st.session_state["truck_mode"] = mode
-                facilities = {"geometryType": "esriGeometryPoint", "spatialReference": {"wkid": 4326},
-                              "features": [{"geometry": {"x": lon, "y": lat}, "attributes": {"Name": name}}]}
-                result = call_api("solveServiceArea", key,
-                                  facilities=json.dumps(facilities),
-                                  travelMode=json.dumps(st.session_state["truck_mode"]),
-                                  defaultBreaks="90,120",
-                                  travelDirection="esriNATravelDirectionToFacility",
-                                  outputPolygons="esriNAOutputPolygonSimplified",
-                                  splitPolygonsAtBreaks="true", overlapPolygons="true",
-                                  returnFacilities="true", outSR="4326")
-                st.session_state["raw"] = result
-                data = convert_polygons(result, name)
-                st.session_state["result"] = {"data": data, "name": name, "lon": lon, "lat": lat}
-            except (RuntimeError, ValueError) as exc:
-                st.session_state["problem"] = str(exc).replace(key, "[redacted]")
+                raw = {"format": "truck-catchments-v2", "requested_breaks": breaks,
+                       "requested_direction": direction, "polygon_type": "cumulative", "responses": []}
+                st.session_state["raw"] = raw
+                st.session_state["result"] = calculate_catchments(
+                    key, name, lon, lat, breaks, direction, st.session_state["truck_mode"], raw)
+        except (RuntimeError, ValueError) as exc:
+            message = str(exc)
+            st.session_state["problem"] = message.replace(key, "[redacted]") if key else message
 
     if "problem" in st.session_state:
         st.error(st.session_state["problem"])
+        st.caption("If a request already completed, save its raw JSON below before retrying. A Both run may contain one completed direction.")
     if "raw" in st.session_state:
+        raw = st.session_state["raw"]
         with st.expander("Esri service messages and raw response"):
-            st.write(st.session_state["raw"].get("messages", []))
-            st.download_button("Download raw Esri JSON", json.dumps(st.session_state["raw"]),
+            if raw.get("format") == "truck-catchments-v2":
+                for entry in raw["responses"]:
+                    st.write(entry["direction"], entry["response"].get("messages", []))
+            else:
+                st.write(raw.get("messages", []))
+            st.download_button("Download raw Esri JSON", json.dumps(raw),
                                file_name="esri_response.json", mime="application/json")
     if "result" not in st.session_state:
         if "problem" not in st.session_state:
-            st.info("Calculate a site, or restore a saved Esri JSON above without a new API request.")
+            st.info("Enter a site, choose drive times and direction, and click Calculate catchments.")
         return
-
     saved = st.session_state["result"]
     data = saved["data"]
-    repairs = sum(f["properties"].get("RepairedRings", 0) for f in data["features"])
-    collapsed = sum(f["properties"].get("CollapsedParts", 0) for f in data["features"])
+    features = data["features"]
+    breaks = sorted({float(f["properties"]["ToBreak"]) for f in features})
+    labels = sorted({f["properties"].get("Direction", "Unknown") for f in features})
+    repairs = sum(f["properties"].get("RepairedRings", 0) for f in features)
     if repairs:
-        st.info("Repaired {} self-intersecting or self-touching boundary ring(s). No routing recalculation was performed during conversion.".format(repairs))
-    if collapsed:
-        st.warning("{} ring(s) contained collapsed line/point parts omitted from polygon output. Keep the raw JSON for review.".format(collapsed))
+        st.info("Repaired {} boundary ring(s) during conversion; no routing recalculation was needed.".format(repairs))
+    if any(f["properties"].get("CollapsedParts", 0) for f in features):
+        st.warning("Collapsed line/point parts were omitted from polygon output. Keep the raw JSON for review.")
     st.success("Catchments ready for {} ({:.5f}, {:.5f}).".format(saved["name"], saved["lon"], saved["lat"]))
+    suffix = "_".join(format(v, "g") for v in breaks)
+    direction_tag = "both" if len(labels) > 1 else labels[0].split()[0].lower()
     st.download_button("Download GeoJSON for QGIS", json.dumps(data),
-                       file_name="truck_catchments_90_120.geojson", mime="application/geo+json")
-    st.caption("Red: 0–90 minutes. Blue: 90–120 minutes. Orange marker: input site.")
+                       file_name="truck_catchments_{}_{}.geojson".format(direction_tag, suffix),
+                       mime="application/geo+json")
+    if "Unknown" in labels:
+        st.warning("This legacy response does not record direction. Its original ring/disk geometry is preserved.")
+    palette = ["#dc2626", "#f59e0b", "#2563eb", "#16a34a", "#9333ea", "#0891b2"]
+    colors = {v: palette[i % len(palette)] for i, v in enumerate(breaks)}
+    st.caption("Time limits: " + " / ".join(format(v, "g") + " min" for v in breaks)
+               + ". From: solid outlines. To: dashed outlines. Use map layers to compare directions and times.")
     m = folium.Map(location=[saved["lat"], saved["lon"]], zoom_start=7, tiles="OpenStreetMap")
-    layer = folium.GeoJson(data, name="Esri truck catchments",
-                          style_function=lambda f: {"color": "#dc2626" if float(f["properties"]["ToBreak"]) == 90 else "#2563eb",
-                                                    "weight": 2.5, "fillOpacity": 0.15},
-                          tooltip=folium.GeoJsonTooltip(fields=["FromBreak", "ToBreak"],
-                                                       aliases=["From (min)", "To (min)"]))
-    layer.add_to(m)
+    bounds = []
+    for label in labels:
+        for value in reversed(breaks):
+            group = {"type": "FeatureCollection", "features": [f for f in features
+                     if f["properties"].get("Direction", "Unknown") == label
+                     and float(f["properties"]["ToBreak"]) == value]}
+            if not group["features"]:
+                continue
+            def style(feature, color=colors[value], dashed=label == "To site"):
+                return {"color": color, "weight": 2.5, "fillOpacity": 0.08,
+                        "dashArray": "7 5" if dashed else None}
+            layer = folium.GeoJson(group, name="{} — {} min".format(label, format(value, "g")),
+                style_function=style, tooltip=folium.GeoJsonTooltip(
+                    fields=["Direction", "FromBreak", "ToBreak"],
+                    aliases=["Direction", "Lower bound (min)", "Upper bound (min)"]))
+            layer.add_to(m)
+            bounds.extend(layer.get_bounds())
     folium.CircleMarker([saved["lat"], saved["lon"]], radius=6, color="#ea580c", fill=True,
                         fill_opacity=1, tooltip=html.escape(saved["name"])).add_to(m)
-    m.fit_bounds(layer.get_bounds())
+    if bounds:
+        m.fit_bounds(bounds)
+    folium.LayerControl(collapsed=False).add_to(m)
     components.html(m.get_root().render(), height=620)
-    st.caption("Routing: Esri. Basemap: © OpenStreetMap contributors. The map preview requires internet access.")
+    st.caption("Routing: Esri. Basemap: © OpenStreetMap contributors. Network coverage varies by location.")
 
 
 if __name__ == "__main__":
-    if os.environ.get("WRRP_WEB_RUNNING") == "1":
+    # Streamlit executes scripts inside its runtime; plain python uses the local launcher.
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    if get_script_run_ctx(suppress_warning=True) is not None:
         web_app()
     else:
         launch()
